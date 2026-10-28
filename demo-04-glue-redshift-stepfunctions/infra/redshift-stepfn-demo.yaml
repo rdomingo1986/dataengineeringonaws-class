@@ -1,0 +1,364 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Demo 04 - Redshift + Step Functions (plataforma de cursos online).
+  Ramificacao data warehouse em paralelo ao data lake: constroi um modelo estrela a
+  partir da zona curada (Demo 01) e o carrega no Amazon Redshift Serverless via COPY
+  (Redshift Data API), orquestrado pelo Step Functions e disparado pelo EventBridge
+  em paralelo a ramificacao existente. Importa recursos da Demo 01 (ImportValue).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-class
+    Description: Prefixo para nomear os recursos.
+  RedshiftDatabaseName:
+    Type: String
+    Default: aws_class_dw
+    Description: Banco de dados do data warehouse no Redshift.
+  RedshiftAdminUser:
+    Type: String
+    Default: dwadmin
+    Description: Usuario administrador do namespace do Redshift.
+  RedshiftBaseCapacity:
+    Type: Number
+    Default: 8
+    Description: Capacidade base do workgroup em RPUs (minimo 8 para otimizar custo).
+  ScriptsBucket:
+    Type: String
+    Description: Bucket S3 com o script PySpark do Glue (glue/curated_to_dimensional.py).
+
+Resources:
+
+  # ===========================================================================
+  # 1) REDSHIFT SERVERLESS - namespace + workgroup (capacidade minima)
+  # ===========================================================================
+
+  # Papel que o Redshift ASSUME para fazer COPY lendo do S3 (o data lake).
+  RedshiftNamespaceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-redshift-copy-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: redshift.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: read-datalake-for-copy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${B}"
+                    - B: !ImportValue aws-class-datalake-BucketName
+                  - !Sub
+                    - "arn:aws:s3:::${B}/*"
+                    - B: !ImportValue aws-class-datalake-BucketName
+
+  RedshiftNamespace:
+    Type: AWS::RedshiftServerless::Namespace
+    Properties:
+      NamespaceName: !Sub "${ProjectName}-dw-ns"
+      AdminUsername: !Ref RedshiftAdminUser
+      AdminUserPassword: "{{resolve:secretsmanager:aws-class-redshift-admin:SecretString:password}}"
+      DbName: !Ref RedshiftDatabaseName
+      IamRoles:
+        - !GetAtt RedshiftNamespaceRole.Arn
+      DefaultIamRoleArn: !GetAtt RedshiftNamespaceRole.Arn
+
+  RedshiftWorkgroup:
+    Type: AWS::RedshiftServerless::Workgroup
+    Properties:
+      WorkgroupName: !Sub "${ProjectName}-dw-wg"
+      NamespaceName: !Ref RedshiftNamespace
+      BaseCapacity: !Ref RedshiftBaseCapacity
+      PubliclyAccessible: false
+
+  # ===========================================================================
+  # 2) GLUE JOB - curated -> modelo dimensional (CSV no staging S3)
+  # ===========================================================================
+  GlueDimJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-glue-dim-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: datalake-and-scripts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${B}"
+                    - B: !ImportValue aws-class-datalake-BucketName
+                  - !Sub
+                    - "arn:aws:s3:::${B}/*"
+                    - B: !ImportValue aws-class-datalake-BucketName
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${ScriptsBucket}"
+                  - !Sub "arn:aws:s3:::${ScriptsBucket}/*"
+
+  CuratedToDimensionalJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-curated-to-dimensional"
+      Role: !GetAtt GlueDimJobRole.Arn
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 15
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${ScriptsBucket}/src/glue/curated_to_dimensional.py"
+      DefaultArguments:
+        "--data_bucket": !ImportValue aws-class-datalake-BucketName
+        "--stage_prefix": "stage/redshift/"
+        "--job-bookmark-option": "job-bookmark-disable"
+
+  # ===========================================================================
+  # 3) STEP FUNCTIONS - orquestra a ramificacao data warehouse
+  #    Glue job (.sync, espera) -> criar schema (Data API + polling) ->
+  #    COPY (Data API + polling) -> fim. Com Retry/Catch.
+  # ===========================================================================
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-redshift-sfn-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: orchestrate-glue-and-redshift
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Iniciar e aguardar o Glue job (.sync usa estas permissoes + eventos)
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:BatchStopJobRun
+                Resource: "*"
+              # Redshift Data API (BatchExecuteStatement = varios comandos juntos)
+              - Effect: Allow
+                Action:
+                  - redshift-data:ExecuteStatement
+                  - redshift-data:BatchExecuteStatement
+                  - redshift-data:DescribeStatement
+                  - redshift-data:GetStatementResult
+                Resource: "*"
+              # A Data API precisa poder autenticar contra o workgroup serverless
+              - Effect: Allow
+                Action:
+                  - redshift-serverless:GetCredentials
+                Resource: "*"
+
+  PipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${ProjectName}-redshift-pipeline"
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionSubstitutions:
+        GlueJobName: !Ref CuratedToDimensionalJob
+        WorkgroupName: !Ref RedshiftWorkgroup
+        DatabaseName: !Ref RedshiftDatabaseName
+        CopyRoleArn: !GetAtt RedshiftNamespaceRole.Arn
+        DataBucket: !ImportValue aws-class-datalake-BucketName
+      DefinitionString: |
+        {
+          "Comment": "Ramificacao data warehouse: curated -> modelo estrela -> Redshift",
+          "StartAt": "RunGlueDimensionalJob",
+          "States": {
+            "RunGlueDimensionalJob": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": { "JobName": "${GlueJobName}" },
+              "Retry": [
+                { "ErrorEquals": ["States.ALL"], "IntervalSeconds": 10, "MaxAttempts": 2, "BackoffRate": 2.0 }
+              ],
+              "Next": "CreateSchema"
+            },
+            "CreateSchema": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:redshiftdata:batchExecuteStatement",
+              "Parameters": {
+                "WorkgroupName": "${WorkgroupName}",
+                "Database": "${DatabaseName}",
+                "Sqls": [
+                  "DROP TABLE IF EXISTS fact_engagement;",
+                  "DROP TABLE IF EXISTS dim_student;",
+                  "DROP TABLE IF EXISTS dim_course;",
+                  "CREATE TABLE dim_student (student_id VARCHAR(32) NOT NULL, student_name VARCHAR(256), student_email VARCHAR(256), region VARCHAR(16), country VARCHAR(8), PRIMARY KEY(student_id)) DISTSTYLE ALL;",
+                  "CREATE TABLE dim_course (course_id VARCHAR(128) NOT NULL, course_name VARCHAR(256), PRIMARY KEY(course_id)) DISTSTYLE ALL;",
+                  "CREATE TABLE fact_engagement (event_id VARCHAR(32) NOT NULL, student_id VARCHAR(32), course_id VARCHAR(128), event_type VARCHAR(32), event_ts VARCHAR(32), event_date DATE, study_minutes DOUBLE PRECISION, score DOUBLE PRECISION, engagement_level VARCHAR(16), is_completed BOOLEAN, PRIMARY KEY(event_id)) DISTKEY(student_id) SORTKEY(event_date);"
+                ]
+              },
+              "ResultPath": "$.schema",
+              "Next": "WaitSchema"
+            },
+            "WaitSchema": {
+              "Type": "Wait", "Seconds": 5, "Next": "CheckSchema"
+            },
+            "CheckSchema": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+              "Parameters": { "Id.$": "$.schema.Id" },
+              "ResultPath": "$.schemaStatus",
+              "Next": "SchemaDone?"
+            },
+            "SchemaDone?": {
+              "Type": "Choice",
+              "Choices": [
+                { "Variable": "$.schemaStatus.Status", "StringEquals": "FINISHED", "Next": "CopyData" },
+                { "Variable": "$.schemaStatus.Status", "StringEquals": "FAILED", "Next": "Failed" },
+                { "Variable": "$.schemaStatus.Status", "StringEquals": "ABORTED", "Next": "Failed" }
+              ],
+              "Default": "WaitSchema"
+            },
+            "CopyData": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:redshiftdata:batchExecuteStatement",
+              "Parameters": {
+                "WorkgroupName": "${WorkgroupName}",
+                "Database": "${DatabaseName}",
+                "Sqls": [
+                  "COPY dim_student FROM 's3://${DataBucket}/stage/redshift/dim_student/' IAM_ROLE '${CopyRoleArn}' FORMAT AS CSV EMPTYASNULL BLANKSASNULL;",
+                  "COPY dim_course FROM 's3://${DataBucket}/stage/redshift/dim_course/' IAM_ROLE '${CopyRoleArn}' FORMAT AS CSV EMPTYASNULL BLANKSASNULL;",
+                  "COPY fact_engagement FROM 's3://${DataBucket}/stage/redshift/fact_engagement/' IAM_ROLE '${CopyRoleArn}' FORMAT AS CSV EMPTYASNULL BLANKSASNULL;"
+                ]
+              },
+              "ResultPath": "$.copy",
+              "Next": "WaitCopy"
+            },
+            "WaitCopy": {
+              "Type": "Wait", "Seconds": 10, "Next": "CheckCopy"
+            },
+            "CheckCopy": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+              "Parameters": { "Id.$": "$.copy.Id" },
+              "ResultPath": "$.copyStatus",
+              "Next": "CopyDone?"
+            },
+            "CopyDone?": {
+              "Type": "Choice",
+              "Choices": [
+                { "Variable": "$.copyStatus.Status", "StringEquals": "FINISHED", "Next": "Success" },
+                { "Variable": "$.copyStatus.Status", "StringEquals": "FAILED", "Next": "Failed" },
+                { "Variable": "$.copyStatus.Status", "StringEquals": "ABORTED", "Next": "Failed" }
+              ],
+              "Default": "WaitCopy"
+            },
+            "Success": { "Type": "Succeed" },
+            "Failed": {
+              "Type": "Fail",
+              "Error": "PipelineFailed",
+              "Cause": "Falha no Glue job ou em um comando do Redshift (ver DescribeStatement)."
+            }
+          }
+        }
+
+  # ===========================================================================
+  # 4) EVENTBRIDGE - dispara a State Machine quando um objeto e criado em raw/
+  #    EM PARALELO a ramificacao do data lake (que tem a sua propria regra na Demo 01).
+  # ===========================================================================
+  EventBridgeInvokeSfnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-eventbridge-sfn-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-state-machine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref PipelineStateMachine
+
+  # Dispara a ramificacao warehouse UMA unica vez, quando o job cleaned->curated da
+  # Demo 01 TERMINA com sucesso. Assim evita-se a tempestade de disparos (um evento
+  # S3 por cada objeto escrito em curated/) e a condicao de corrida (curated escrito
+  # pela metade). O warehouse comeca com curated ja completo.
+  CuratedJobSucceededRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-curated-job-succeeded"
+      Description: >
+        Dispara a ramificacao warehouse (Step Functions -> Redshift) quando o Glue
+        job cleaned->curated termina com sucesso.
+      EventPattern: |
+        {
+          "source": ["aws.glue"],
+          "detail-type": ["Glue Job State Change"],
+          "detail": {
+            "jobName": ["aws-class-cleaned-to-curated"],
+            "state": ["SUCCEEDED"]
+          }
+        }
+      Targets:
+        - Id: redshift-pipeline-sfn
+          Arn: !Ref PipelineStateMachine
+          RoleArn: !GetAtt EventBridgeInvokeSfnRole.Arn
+
+Outputs:
+  RedshiftWorkgroupName:
+    Description: Workgroup do Redshift Serverless.
+    Value: !Ref RedshiftWorkgroup
+    Export:
+      Name: aws-class-redshift-WorkgroupName
+  RedshiftDatabase:
+    Description: Banco de dados do data warehouse.
+    Value: !Ref RedshiftDatabaseName
+    Export:
+      Name: aws-class-redshift-Database
+  RedshiftCopyRoleArn:
+    Description: Papel que o Redshift usa para o COPY a partir do S3.
+    Value: !GetAtt RedshiftNamespaceRole.Arn
+    Export:
+      Name: aws-class-redshift-CopyRoleArn
+  DimensionalJobName:
+    Description: Glue job curated -> modelo dimensional.
+    Value: !Ref CuratedToDimensionalJob
+    Export:
+      Name: aws-class-redshift-DimensionalJob
+  StagePrefix:
+    Description: Prefixo S3 de staging do modelo dimensional.
+    Value: "stage/redshift/"

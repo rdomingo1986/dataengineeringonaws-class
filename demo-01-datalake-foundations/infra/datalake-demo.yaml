@@ -1,0 +1,726 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Demo 01 - Data Lake Foundations (plataforma de cursos online).
+  S3 (raw/cleaned/curated) + 2 Glue jobs encadenados por EventBridge (Lambda disparadora)
+  + Glue Data Catalog (DB + 3 crawlers) + Athena workgroup. Controle de acesso por
+  IAM (Lake Formation chega na Demo 02). O bucket NAO e registrado no Lake Formation.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-class
+    Description: Prefixo para nomear os recursos.
+  GlueDatabaseName:
+    Type: String
+    Default: aws_class_datalake
+    Description: Nome do banco de dados do Glue Data Catalog.
+  CpfSalt:
+    Type: String
+    Default: aws-class-demo-salt
+    NoEcho: true
+    Description: Salt para o hash do CPF na zona curated.
+  ScriptsBucket:
+    Type: String
+    Description: >
+      Bucket S3 onde estao os scripts PySpark do Glue (glue/raw_to_cleaned.py e
+      glue/cleaned_to_curated.py). O script de deploy os envia antes do deploy.
+      Pode ser o mesmo bucket de artefatos do CloudFormation.
+  TrustedPrincipalArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN do principal que podera fazer switch role (sts:AssumeRole) para o papel
+      de analista. Se ficar vazio, usa-se a raiz da conta (root).
+  LakeFormationEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Use "true" SOMENTE se o bucket estiver registrado no Lake Formation (Demo 02
+      implantada). Quando e "true", concedem-se permissoes de LF ao papel do crawler
+      para que possa criar/catalogar tabelas sobre o bucket governado. Por padrao
+      "false": a Demo 01 funciona como data lake com IAM puro, independente.
+
+Conditions:
+  UseAccountRoot: !Equals [!Ref TrustedPrincipalArn, ""]
+  LakeFormationOn: !Equals [!Ref LakeFormationEnabled, "true"]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 120
+    MemorySize: 256
+    Architectures:
+      - x86_64
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # S3 - Data lake (zonas raw / cleaned / curated num unico bucket)
+  # ---------------------------------------------------------------------------
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Nota: o EventBridge no bucket e habilitado com um comando a parte apos o
+      # deploy (ver scripts/deploy) porque a Early Validation do CloudFormation
+      # rejeita o objeto vazio EventBridgeConfiguration: {}.
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Demo
+          Value: "01-datalake-foundations"
+
+  # Bucket para resultados de consultas do Athena
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-athena-results-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-athena-results
+            Status: Enabled
+            ExpirationInDays: 7
+
+  # ---------------------------------------------------------------------------
+  # Inicializador de prefixos do data lake.
+  # Os crawlers do Glue validam que o path S3 exista ao serem criados; como raw/,
+  # cleaned/ e curated/ nao existem ate enviar o primeiro objeto, criamos
+  # objetos marcadores (zero-byte) para cada zona com um Custom Resource.
+  # ---------------------------------------------------------------------------
+  PrefixInitFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-prefix-init"
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 60
+      InlineCode: |
+        import json
+        import urllib.request
+        import boto3
+
+        s3 = boto3.client("s3")
+        PREFIXES = [
+            "raw/student-events/",
+            "cleaned/student-events/",
+            "curated/student-engagement/",
+        ]
+
+        def send(event, context, status, data=None):
+            body = json.dumps({
+                "Status": status,
+                "Reason": f"See CloudWatch log stream: {context.log_stream_name}",
+                "PhysicalResourceId": event.get("PhysicalResourceId", context.log_stream_name),
+                "StackId": event["StackId"],
+                "RequestId": event["RequestId"],
+                "LogicalResourceId": event["LogicalResourceId"],
+                "Data": data or {},
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                event["ResponseURL"], data=body, method="PUT",
+                headers={"content-type": "", "content-length": str(len(body))},
+            )
+            urllib.request.urlopen(req)
+
+        def handler(event, context):
+            try:
+                bucket = event["ResourceProperties"]["BucketName"]
+                if event["RequestType"] in ("Create", "Update"):
+                    for p in PREFIXES:
+                        s3.put_object(Bucket=bucket, Key=p)
+                # No Delete nao apagamos nada: o bucket se esvazia/elimina a parte.
+                send(event, context, "SUCCESS")
+            except Exception as e:
+                print("ERROR:", e)
+                send(event, context, "FAILED", {"Error": str(e)})
+      Policies:
+        - Statement:
+            - Sid: InitPrefixes
+              Effect: Allow
+              Action:
+                - s3:PutObject
+              Resource: !Sub "arn:aws:s3:::${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}/*"
+
+  PrefixInit:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: DataLakeBucket
+    Properties:
+      ServiceToken: !GetAtt PrefixInitFunction.Arn
+      BucketName: !Sub "${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}"
+
+  # ---------------------------------------------------------------------------
+  # Glue ETL (PySpark) - transformacoes raw->cleaned e cleaned->curated.
+  # Os scripts .py ficam no S3 (ScriptsBucket). Cada job reprocessa seu prefixo
+  # de entrada (idempotente) e escreve o seguinte. Sao disparados por EventBridge.
+  # ---------------------------------------------------------------------------
+
+  # Papel de execucao compartilhado por ambos os Glue jobs.
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-glue-job-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: datalake-and-scripts-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Ler/escrever as zonas do data lake
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}"
+                  - !Sub "arn:aws:s3:::${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}/*"
+              # Ler os scripts PySpark
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${ScriptsBucket}"
+                  - !Sub "arn:aws:s3:::${ScriptsBucket}/*"
+
+  # Job 1: raw -> cleaned
+  RawToCleanedJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-raw-to-cleaned"
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 15
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${ScriptsBucket}/src/glue/raw_to_cleaned.py"
+      DefaultArguments:
+        "--data_bucket": !Sub "${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}"
+        "--job-bookmark-option": "job-bookmark-disable"
+
+  # Job 2: cleaned -> curated
+  CleanedToCuratedJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-cleaned-to-curated"
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 15
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${ScriptsBucket}/src/glue/cleaned_to_curated.py"
+      DefaultArguments:
+        "--data_bucket": !Sub "${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}"
+        "--cpf_salt": !Sub "${CpfSalt}"
+        "--job-bookmark-option": "job-bookmark-disable"
+
+  # ---------------------------------------------------------------------------
+  # EventBridge - encadeia S3 -> Glue job (uma regra por etapa).
+  # O bucket emite eventos para o EventBridge (EventBridgeConfiguration no bucket).
+  # As regras filtram por prefixo e INICIAM o Glue job correspondente.
+  # ---------------------------------------------------------------------------
+
+  # Lambda disparadora: o EventBridge nao pode invocar um Glue job diretamente,
+  # entao esta funcao minima recebe o evento e inicia o job adequado
+  # conforme o prefixo (raw/ ou cleaned/). O processamento vive nos Glue jobs PySpark.
+  GlueTriggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-glue-trigger"
+      CodeUri: ../src/trigger/
+      Handler: handler.handler
+      Runtime: python3.12
+      Timeout: 30
+      Description: Inicia o Glue job correspondente conforme o prefixo S3.
+      Environment:
+        Variables:
+          RAW_TO_CLEANED_JOB: !Ref RawToCleanedJob
+          CLEANED_TO_CURATED_JOB: !Ref CleanedToCuratedJob
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: glue:StartJobRun
+              Resource:
+                - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${ProjectName}-raw-to-cleaned"
+                - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${ProjectName}-cleaned-to-curated"
+      Events:
+        RawObjectCreated:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.s3
+              detail-type:
+                - "Object Created"
+              detail:
+                bucket:
+                  name:
+                    - !Sub "${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}"
+                object:
+                  key:
+                    - prefix: "raw/"
+        CleanedObjectCreated:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.s3
+              detail-type:
+                - "Object Created"
+              detail:
+                bucket:
+                  name:
+                    - !Sub "${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}"
+                object:
+                  key:
+                    - prefix: "cleaned/"
+
+  # ---------------------------------------------------------------------------
+  # Glue Data Catalog - banco de dados e crawlers por zona
+  # ---------------------------------------------------------------------------
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: Catalogo do data lake da plataforma de cursos online (demo 01).
+
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-glue-crawler-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: read-datalake-bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}"
+                  - !Sub "arn:aws:s3:::${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}/*"
+
+  # --- Permissoes de Lake Formation para o role do crawler (so se LF estiver ON).
+  # Quando o bucket esta registrado no Lake Formation (Demo 02), o crawler
+  # precisa de permissoes de LF para criar/catalogar tabelas; IAM+S3 nao basta.
+  CrawlerDataLocationGrant:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Condition: LakeFormationOn
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt GlueCrawlerRole.Arn
+      Resource:
+        DataLocation:
+          CatalogId: !Ref AWS::AccountId
+          ResourceArn: !Sub "arn:aws:s3:::${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}"
+      Permissions:
+        - DATA_LOCATION_ACCESS
+      PermissionsWithGrantOption: []
+
+  CrawlerDatabaseGrant:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Condition: LakeFormationOn
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt GlueCrawlerRole.Arn
+      Resource:
+        Database:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref GlueDatabaseName
+      Permissions:
+        - CREATE_TABLE
+        - ALTER
+        - DESCRIBE
+      PermissionsWithGrantOption: []
+
+  RawCrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn: PrefixInit
+    Properties:
+      Name: !Sub "${ProjectName}-crawler-raw"
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabaseName
+      TablePrefix: raw_
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}/raw/"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  CleanedCrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn: PrefixInit
+    Properties:
+      Name: !Sub "${ProjectName}-crawler-cleaned"
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabaseName
+      TablePrefix: cleaned_
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}/cleaned/"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  CuratedCrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn: PrefixInit
+    Properties:
+      Name: !Sub "${ProjectName}-crawler-curated"
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabaseName
+      TablePrefix: curated_
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}/curated/"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  # ---------------------------------------------------------------------------
+  # Athena - workgroup dedicado com local de resultados
+  # ---------------------------------------------------------------------------
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${ProjectName}-datalake-wg"
+      Description: Workgroup para a demo do data lake da plataforma de cursos online.
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${ProjectName}-athena-results-${AWS::AccountId}-${AWS::Region}/results/"
+
+  # ---------------------------------------------------------------------------
+  # ROLES POR ZONA (somente consulta) - para demonstrar o modelo IAM + S3.
+  # Nenhum e admin nem usa Lake Formation. Cada role representa um PERFIL de
+  # pessoa e so pode ler o seu PREFIXO no S3. Isso demonstra o ponto central
+  # da Demo 01: em IAM + S3, isolar o acesso = isolar por prefixo/objeto.
+  #
+  # Nota didatica: os tres podem VER no catalogo do Glue que existem todas
+  # as tabelas (metadados), mas so podem LER os dados da sua zona. Se o
+  # raw-data-engineer consultar a tabela curated, o Athena vai falhar ao ler o S3
+  # porque seu IAM nao permite GetObject fora de raw/. "O catalogo descreve,
+  # mas IAM+S3 autorizam".
+  #
+  # A base comum de permissoes (Athena + ler catalogo Glue + resultados Athena)
+  # se repete em cada role porque o CloudFormation nao permite heranca entre roles.
+  # ---------------------------------------------------------------------------
+
+  # --- raw/  -> Data Engineer (trabalha com dados brutos / ingestao) ---
+  RawDataEngineerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-raw-data-engineer"
+      Description: >
+        Data Engineer. So le a zona raw/ via IAM+S3 (sem Lake Formation).
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !If
+                - UseAccountRoot
+                - !Sub "arn:aws:iam::${AWS::AccountId}:root"
+                - !Ref TrustedPrincipalArn
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: query-raw-zone
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: UseAthena
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                  - athena:GetWorkGroup
+                  - athena:ListWorkGroups
+                Resource: "*"
+              - Sid: ReadGlueCatalog
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                Resource: "*"
+              # Listar o bucket mas SOMENTE o prefixo raw/
+              - Sid: ListRawPrefix
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}"
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - "raw/*"
+              # Ler dados SOMENTE de raw/
+              - Sid: ReadRawData
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:aws:s3:::${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}"
+                  - !Sub "arn:aws:s3:::${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}/raw/*"
+              - Sid: AthenaResults
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:aws:s3:::${ProjectName}-athena-results-${AWS::AccountId}-${AWS::Region}"
+                  - !Sub "arn:aws:s3:::${ProjectName}-athena-results-${AWS::AccountId}-${AWS::Region}/*"
+
+  # --- cleaned/  -> Data Analyst (analise exploratoria sobre dados limpos) ---
+  CleanedDataAnalystRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-cleaned-data-analyst"
+      Description: >
+        Data Analyst. So le a zona cleaned/ via IAM+S3 (sem Lake Formation).
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !If
+                - UseAccountRoot
+                - !Sub "arn:aws:iam::${AWS::AccountId}:root"
+                - !Ref TrustedPrincipalArn
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: query-cleaned-zone
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: UseAthena
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                  - athena:GetWorkGroup
+                  - athena:ListWorkGroups
+                Resource: "*"
+              - Sid: ReadGlueCatalog
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                Resource: "*"
+              - Sid: ListCleanedPrefix
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}"
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - "cleaned/*"
+              - Sid: ReadCleanedData
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:aws:s3:::${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}"
+                  - !Sub "arn:aws:s3:::${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}/cleaned/*"
+              - Sid: AthenaResults
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:aws:s3:::${ProjectName}-athena-results-${AWS::AccountId}-${AWS::Region}"
+                  - !Sub "arn:aws:s3:::${ProjectName}-athena-results-${AWS::AccountId}-${AWS::Region}/*"
+
+  # --- curated/  -> BI Analyst (metricas de negocio sobre dados curados) ---
+  CuratedBiAnalystRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-curated-bi-analyst"
+      Description: >
+        BI Analyst. So le a zona curated/ via IAM+S3 (sem Lake Formation).
+        Na Demo 02 este sera o role governado pelo Lake Formation.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !If
+                - UseAccountRoot
+                - !Sub "arn:aws:iam::${AWS::AccountId}:root"
+                - !Ref TrustedPrincipalArn
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: query-curated-zone
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: UseAthena
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                  - athena:GetWorkGroup
+                  - athena:ListWorkGroups
+                Resource: "*"
+              - Sid: ReadGlueCatalog
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                Resource: "*"
+              - Sid: ListCuratedPrefix
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}"
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - "curated/*"
+              - Sid: ReadCuratedData
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:aws:s3:::${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}"
+                  - !Sub "arn:aws:s3:::${ProjectName}-datalake-${AWS::AccountId}-${AWS::Region}/curated/*"
+              - Sid: AthenaResults
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:aws:s3:::${ProjectName}-athena-results-${AWS::AccountId}-${AWS::Region}"
+                  - !Sub "arn:aws:s3:::${ProjectName}-athena-results-${AWS::AccountId}-${AWS::Region}/*"
+
+Outputs:
+  DataLakeBucketName:
+    Description: Bucket do data lake (zonas raw/cleaned/curated).
+    Value: !Ref DataLakeBucket
+    Export:
+      Name: aws-class-datalake-BucketName
+  DataLakeBucketArn:
+    Description: ARN do bucket do data lake (usado pelo Lake Formation na Demo 02).
+    Value: !GetAtt DataLakeBucket.Arn
+    Export:
+      Name: aws-class-datalake-BucketArn
+  AthenaResultsBucketName:
+    Description: Bucket de resultados do Athena.
+    Value: !Ref AthenaResultsBucket
+    Export:
+      Name: aws-class-datalake-AthenaResultsBucketName
+  GlueDatabase:
+    Description: Banco de dados do Glue Data Catalog.
+    Value: !Ref GlueDatabaseName
+    Export:
+      Name: aws-class-datalake-GlueDatabase
+  AthenaWorkGroupName:
+    Description: Workgroup do Athena para as consultas da demo.
+    Value: !Ref AthenaWorkGroup
+    Export:
+      Name: aws-class-datalake-AthenaWorkGroup
+  CuratedTableName:
+    Description: >
+      Nome real da tabela curada que o crawler registra. Com o TablePrefix
+      'curated_' sobre a pasta raiz 'curated/', o crawler a nomeia
+      'curated_curated'. A Demo 02 a referencia por este nome.
+    Value: curated_curated
+    Export:
+      Name: aws-class-datalake-CuratedTableName
+  RawDataEngineerRoleArn:
+    Description: Role Data Engineer (somente zona raw/, IAM+S3). Switch role.
+    Value: !GetAtt RawDataEngineerRole.Arn
+  CleanedDataAnalystRoleArn:
+    Description: Role Data Analyst (somente zona cleaned/, IAM+S3). Switch role.
+    Value: !GetAtt CleanedDataAnalystRole.Arn
+  CuratedBiAnalystRoleArn:
+    Description: Role BI Analyst (somente zona curated/, IAM+S3). Switch role.
+    Value: !GetAtt CuratedBiAnalystRole.Arn
+  SwitchRoleConsoleRawEngineer:
+    Description: Link switch role (console) - Data Engineer (raw).
+    Value: !Sub "https://signin.aws.amazon.com/switchrole?account=${AWS::AccountId}&roleName=${ProjectName}-raw-data-engineer&displayName=Raw-DataEngineer"
+  SwitchRoleConsoleCleanedAnalyst:
+    Description: Link switch role (console) - Data Analyst (cleaned).
+    Value: !Sub "https://signin.aws.amazon.com/switchrole?account=${AWS::AccountId}&roleName=${ProjectName}-cleaned-data-analyst&displayName=Cleaned-DataAnalyst"
+  SwitchRoleConsoleCuratedBi:
+    Description: Link switch role (console) - BI Analyst (curated).
+    Value: !Sub "https://signin.aws.amazon.com/switchrole?account=${AWS::AccountId}&roleName=${ProjectName}-curated-bi-analyst&displayName=Curated-BIAnalyst"
+  RawCrawlerName:
+    Value: !Ref RawCrawler
+  CleanedCrawlerName:
+    Value: !Ref CleanedCrawler
+  CuratedCrawlerName:
+    Value: !Ref CuratedCrawler

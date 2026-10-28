@@ -1,0 +1,395 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Demo 02 - Lake Formation Access Control (plataforma de cursos online).
+  Registra o bucket do data lake da Demo 01 no Lake Formation e demonstra
+  os dois modelos de permissoes (Named Resource vs LF-Tags) sobre A MESMA tabela
+  curada, usando um papel IAM por modelo (assumiveis por switch role).
+  Importa recursos da Demo 01 via Fn::ImportValue.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-class
+    Description: Prefixo para nomear os recursos desta demo.
+
+  DeployerPrincipalArn:
+    Type: String
+    Description: >
+      ARN do usuario/papel que implanta este stack. E adicionado como Data Lake
+      Administrator para poder administrar o Lake Formation apos a implantacao.
+      Ex: arn:aws:iam::<ACCOUNT_ID>:user/<SEU_USUARIO>
+
+  TrustedPrincipalArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN do principal que podera fazer switch role (sts:AssumeRole) aos papeis
+      da demo. Se deixado vazio, usa-se a raiz da conta (root), o que permite a
+      qualquer principal com permissao de AssumeRole assumir os papeis.
+
+  RowFilterRegion:
+    Type: String
+    Default: BR-SP
+    Description: Valor de region para o exemplo de filtro por linha (row-level).
+
+  CuratedTableNameOverride:
+    Type: String
+    Default: ""
+    Description: >
+      Nome real da tabela curada no Glue Data Catalog. Se deixado vazio,
+      usa-se o valor importado da Demo 01 (curated_curated). Use este
+      parametro se o crawler registrou a tabela com outro nome.
+
+  # Nota: o modo HIBRIDO nao e gerenciado aqui. O CloudFormation nao consegue
+  # atualizar HybridAccessEnabled sobre uma location registrada com
+  # service-linked role. A mudanca so-LF <-> hibrido e feita FORA do
+  # CloudFormation com os scripts scripts/enable-hybrid e scripts/disable-hybrid
+  # (deregister + register). O template registra a location em modo so-LF.
+
+Conditions:
+  UseAccountRoot: !Equals [!Ref TrustedPrincipalArn, ""]
+  UseImportedTableName: !Equals [!Ref CuratedTableNameOverride, ""]
+
+Resources:
+
+  # ===========================================================================
+  # 1) ROLES IAM - um por modelo, assumiveis por switch role
+  # ===========================================================================
+
+  # --- Papel Data Lake Administrator da demo ---
+  LfAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lf-admin"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !If
+                - UseAccountRoot
+                - !Sub "arn:aws:iam::${AWS::AccountId}:root"
+                - !Ref TrustedPrincipalArn
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLakeFormationDataAdmin
+        - arn:aws:iam::aws:policy/AmazonAthenaFullAccess
+      Policies:
+        - PolicyName: athena-results-and-glue
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${B}"
+                    - B: !ImportValue aws-class-datalake-AthenaResultsBucketName
+                  - !Sub
+                    - "arn:aws:s3:::${B}/*"
+                    - B: !ImportValue aws-class-datalake-AthenaResultsBucketName
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartitions
+                Resource: "*"
+
+  # --- Papel que demonstra o modelo NAMED RESOURCE ---
+  LfNamedResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lf-named-resource"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !If
+                - UseAccountRoot
+                - !Sub "arn:aws:iam::${AWS::AccountId}:root"
+                - !Ref TrustedPrincipalArn
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonAthenaFullAccess
+      Policies:
+        - PolicyName: lf-analyst-base
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Permissao para que o Lake Formation entregue credenciais de dados
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                Resource: "*"
+              # Glue: catalogo (as permissoes finas sao aplicadas pelo Lake Formation)
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartitions
+                Resource: "*"
+              # Athena: resultados da consulta
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${B}"
+                    - B: !ImportValue aws-class-datalake-AthenaResultsBucketName
+                  - !Sub
+                    - "arn:aws:s3:::${B}/*"
+                    - B: !ImportValue aws-class-datalake-AthenaResultsBucketName
+
+  # --- Papel que demonstra o modelo LF-TAGS ---
+  LfTagsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lf-lftags"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !If
+                - UseAccountRoot
+                - !Sub "arn:aws:iam::${AWS::AccountId}:root"
+                - !Ref TrustedPrincipalArn
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonAthenaFullAccess
+      Policies:
+        - PolicyName: lf-analyst-base
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartitions
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${B}"
+                    - B: !ImportValue aws-class-datalake-AthenaResultsBucketName
+                  - !Sub
+                    - "arn:aws:s3:::${B}/*"
+                    - B: !ImportValue aws-class-datalake-AthenaResultsBucketName
+
+  # ===========================================================================
+  # 2) LAKE FORMATION - settings (administradores)
+  # ===========================================================================
+  DataLakeSettings:
+    Type: AWS::LakeFormation::DataLakeSettings
+    Properties:
+      # Admins: o papel admin da demo + o principal que implanta.
+      Admins:
+        - DataLakePrincipalIdentifier: !GetAtt LfAdminRole.Arn
+        - DataLakePrincipalIdentifier: !Ref DeployerPrincipalArn
+      # Importante para a demo: NAO conceder IAMAllowedPrincipals por padrao,
+      # para que as permissoes de granularidade fina realmente se apliquem.
+      CreateDatabaseDefaultPermissions: []
+      CreateTableDefaultPermissions: []
+
+  # ===========================================================================
+  # 3) REGISTRO DA DATA LOCATION (o bucket da Demo 01)
+  # ===========================================================================
+  DataLakeLocation:
+    Type: AWS::LakeFormation::Resource
+    DependsOn: DataLakeSettings
+    Properties:
+      ResourceArn: !ImportValue aws-class-datalake-BucketArn
+      # Usa o service-linked role AWSServiceRoleForLakeFormationDataAccess.
+      # Registra-se em modo so-LF; a mudanca para hibrido e feita com os scripts
+      # (deregister + register) porque o CloudFormation nao consegue atualiza-lo.
+      UseServiceLinkedRole: true
+
+  # ===========================================================================
+  # 4) MODELO NAMED RESOURCE
+  #    SELECT sobre a tabela curada EXCLUINDO as colunas PII.
+  # ===========================================================================
+  NamedResourceGrant:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn: DataLakeLocation
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt LfNamedResourceRole.Arn
+      Resource:
+        TableWithColumns:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !ImportValue aws-class-datalake-GlueDatabase
+          Name: !If
+            - UseImportedTableName
+            - !ImportValue aws-class-datalake-CuratedTableName
+            - !Ref CuratedTableNameOverride
+          # Column-level security: todas MENOS as PII.
+          ColumnWildcard:
+            ExcludedColumnNames:
+              - student_email
+              - cpf_hash
+      Permissions:
+        - SELECT
+      PermissionsWithGrantOption: []
+
+  # ===========================================================================
+  # 5) MODELO LF-TAGS
+  # ===========================================================================
+
+  # --- LF-Tag de sensibilidade (classificacao PII / nao PII) ---
+  SensitivityTag:
+    Type: AWS::LakeFormation::Tag
+    DependsOn: DataLakeSettings
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      TagKey: sensitivity
+      TagValues:
+        - pii
+        - non_pii
+
+  # --- LF-Tag de zona do data lake ---
+  ZoneTag:
+    Type: AWS::LakeFormation::Tag
+    DependsOn: DataLakeSettings
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      TagKey: zone
+      TagValues:
+        - raw
+        - cleaned
+        - curated
+
+  # --- Associacao: a tabela curada pertence a zona 'curated' ---
+  TableZoneAssociation:
+    Type: AWS::LakeFormation::TagAssociation
+    DependsOn:
+      - ZoneTag
+      - DataLakeLocation
+    Properties:
+      Resource:
+        Table:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !ImportValue aws-class-datalake-GlueDatabase
+          Name: !If
+            - UseImportedTableName
+            - !ImportValue aws-class-datalake-CuratedTableName
+            - !Ref CuratedTableNameOverride
+      LFTags:
+        - CatalogId: !Ref AWS::AccountId
+          TagKey: zone
+          TagValues:
+            - curated
+
+  # --- Associacao: colunas PII etiquetadas sensitivity=pii ---
+  EmailPiiAssociation:
+    Type: AWS::LakeFormation::TagAssociation
+    DependsOn:
+      - SensitivityTag
+      - DataLakeLocation
+    Properties:
+      Resource:
+        TableWithColumns:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !ImportValue aws-class-datalake-GlueDatabase
+          Name: !If
+            - UseImportedTableName
+            - !ImportValue aws-class-datalake-CuratedTableName
+            - !Ref CuratedTableNameOverride
+          ColumnNames:
+            - student_email
+            - cpf_hash
+      LFTags:
+        - CatalogId: !Ref AWS::AccountId
+          TagKey: sensitivity
+          TagValues:
+            - pii
+
+  # --- Permissao ao papel LF-Tags: DESCRIBE/ASSOCIATE sobre as LF-Tags ---
+  LfTagsDescribeSensitivity:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn: SensitivityTag
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt LfTagsRole.Arn
+      Resource:
+        LFTag:
+          CatalogId: !Ref AWS::AccountId
+          TagKey: sensitivity
+          TagValues:
+            - pii
+            - non_pii
+      Permissions:
+        - DESCRIBE
+      PermissionsWithGrantOption: []
+
+  # --- Permissao ao papel LF-Tags: SELECT por expressao de tags ---
+  #     Ve tabelas da zona 'curated' mas SOMENTE colunas nao PII.
+  LfTagsSelectGrant:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn:
+      - TableZoneAssociation
+      - EmailPiiAssociation
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt LfTagsRole.Arn
+      Resource:
+        LFTagPolicy:
+          CatalogId: !Ref AWS::AccountId
+          ResourceType: TABLE
+          Expression:
+            - TagKey: zone
+              TagValues:
+                - curated
+            - TagKey: sensitivity
+              TagValues:
+                - non_pii
+      Permissions:
+        - SELECT
+        - DESCRIBE
+      PermissionsWithGrantOption: []
+
+Outputs:
+  LfAdminRoleArn:
+    Description: Papel Data Lake Administrator da demo (para switch role).
+    Value: !GetAtt LfAdminRole.Arn
+  LfNamedResourceRoleArn:
+    Description: Papel que demonstra o modelo Named Resource.
+    Value: !GetAtt LfNamedResourceRole.Arn
+  LfTagsRoleArn:
+    Description: Papel que demonstra o modelo LF-Tags.
+    Value: !GetAtt LfTagsRole.Arn
+  SwitchRoleConsoleNamed:
+    Description: Link de switch role (console) para o papel Named Resource.
+    Value: !Sub "https://signin.aws.amazon.com/switchrole?account=${AWS::AccountId}&roleName=${ProjectName}-lf-named-resource&displayName=LF-Named"
+  SwitchRoleConsoleTags:
+    Description: Link de switch role (console) para o papel LF-Tags.
+    Value: !Sub "https://signin.aws.amazon.com/switchrole?account=${AWS::AccountId}&roleName=${ProjectName}-lf-lftags&displayName=LF-Tags"
+  CuratedTableGoverned:
+    Description: Tabela curada governada por esta demo.
+    Value: !If
+      - UseImportedTableName
+      - !ImportValue aws-class-datalake-CuratedTableName
+      - !Ref CuratedTableNameOverride

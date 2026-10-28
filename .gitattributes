@@ -1,0 +1,33 @@
+# Normalização de fins de linha para o repositório de demos.
+# Evita que scripts .sh quebrem no Linux por causa de CRLF do Windows.
+
+# Por padrão, o Git normaliza texto no commit e usa o fim de linha nativo no checkout.
+* text=auto
+
+# Scripts bash: SEMPRE LF (senão falham no Linux com "$'\r': command not found").
+*.sh text eol=lf
+
+# Scripts PowerShell e batch: CRLF (nativo do Windows).
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Demais arquivos de texto: LF (consistente em qualquer SO).
+*.py   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.json text eol=lf
+*.sql  text eol=lf
+*.md   text eol=lf
+*.csv  text eol=lf
+*.txt  text eol=lf
+
+# Arquivos binários (não normalizar).
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.pdf  binary
+*.zip  binary
+*.parquet binary

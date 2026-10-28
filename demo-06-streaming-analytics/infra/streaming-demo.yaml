@@ -1,0 +1,199 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Demo 06 - Streaming Analytics (plataforma de cursos online). Demo autonoma e independente.
+  Eventos em tempo real -> Kinesis Data Streams, com DOIS consumidores em paralelo:
+   1) O Firehose entrega o stream ao S3 (JSON) para consulta com Athena.
+   2) A Lambda consome o stream e publica metricas no CloudWatch; um dashboard as
+      plota em tempo (quase) real.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-class
+    Description: Prefixo para nomear os recursos.
+
+Resources:
+
+  # ===========================================================================
+  # 1) KINESIS DATA STREAMS - o stream (modo ON_DEMAND, sem gerenciar shards)
+  # ===========================================================================
+  EventsStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub "${ProjectName}-events-stream"
+      StreamModeDetails:
+        StreamMode: ON_DEMAND
+
+  # ===========================================================================
+  # 2) S3 - destino da ingestao (o que o Firehose escreve)
+  # ===========================================================================
+  StreamingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-streaming-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # ===========================================================================
+  # 3) FIREHOSE - entrega o stream ao S3 (ramificacao de ingestao analitica)
+  # ===========================================================================
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-firehose-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: firehose-to-s3-and-kinesis
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${ProjectName}-streaming-${AWS::AccountId}-${AWS::Region}"
+                  - !Sub "arn:aws:s3:::${ProjectName}-streaming-${AWS::AccountId}-${AWS::Region}/*"
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                Resource: !GetAtt EventsStream.Arn
+
+  DeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub "${ProjectName}-events-to-s3"
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt EventsStream.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Sub "arn:aws:s3:::${ProjectName}-streaming-${AWS::AccountId}-${AWS::Region}"
+        RoleARN: !GetAtt FirehoseRole.Arn
+        Prefix: "events/dt=!{timestamp:yyyy-MM-dd}/"
+        ErrorOutputPrefix: "errors/"
+        # Micro-batches: entrega a cada 60s ou ao acumular 5 MB, o que ocorrer antes.
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 5
+        CompressionFormat: UNCOMPRESSED
+
+  # ===========================================================================
+  # 4) LAMBDA CONSUMIDORA - le o stream e publica metricas no CloudWatch
+  # ===========================================================================
+  ConsumerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-stream-consumer"
+      CodeUri: ../src/lambda/
+      Handler: consumer.handler
+      Runtime: python3.12
+      Timeout: 60
+      MemorySize: 128
+      Description: Consome o stream e publica metricas de eventos no CloudWatch.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: cloudwatch:PutMetricData
+              Resource: "*"
+      Events:
+        KinesisSource:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt EventsStream.Arn
+            StartingPosition: LATEST
+            BatchSize: 50
+            MaximumBatchingWindowInSeconds: 10
+
+  # ===========================================================================
+  # 5) CLOUDWATCH DASHBOARD - metricas do stream em tempo (quase) real
+  # ===========================================================================
+  StreamingDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ProjectName}-streaming"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Eventos totais por minuto",
+                "region": "${AWS::Region}",
+                "stat": "Sum", "period": 60,
+                "metrics": [
+                  [ "AwsClass/Streaming", "EventsTotal" ]
+                ],
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Eventos por tipo",
+                "region": "${AWS::Region}",
+                "stat": "Sum", "period": 60,
+                "view": "timeSeries",
+                "metrics": [
+                  [ "AwsClass/Streaming", "EventCount", "EventType", "video_play" ],
+                  [ "...", "EventType", "video_pause" ],
+                  [ "...", "EventType", "video_seek" ],
+                  [ "...", "EventType", "quiz_submitted" ],
+                  [ "...", "EventType", "page_view" ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 6, "width": 24, "height": 6,
+              "properties": {
+                "title": "Eventos por curso",
+                "region": "${AWS::Region}",
+                "stat": "Sum", "period": 60,
+                "view": "timeSeries",
+                "metrics": [
+                  [ "AwsClass/Streaming", "EventCount", "Course", "Python para Dados" ],
+                  [ "...", "Course", "Fundamentos de AWS" ],
+                  [ "...", "Course", "SQL Avancado" ],
+                  [ "...", "Course", "Machine Learning" ],
+                  [ "...", "Course", "Engenharia de Dados" ],
+                  [ "...", "Course", "Visualizacao de Dados" ]
+                ]
+              }
+            }
+          ]
+        }
+
+Outputs:
+  StreamName:
+    Description: Nome do Kinesis Data Stream (para o produtor).
+    Value: !Ref EventsStream
+  StreamingBucketName:
+    Description: Bucket onde o Firehose entrega os eventos.
+    Value: !Ref StreamingBucket
+  DashboardName:
+    Description: Dashboard do CloudWatch com as metricas do stream.
+    Value: !Sub "${ProjectName}-streaming"
+  DashboardUrl:
+    Description: Link direto para o dashboard.
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/${ProjectName}-streaming"

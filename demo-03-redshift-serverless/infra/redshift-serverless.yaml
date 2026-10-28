@@ -1,0 +1,87 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Demo 03 - Redshift Serverless (plataforma de cursos online) - fundamentos.
+  Cria um Amazon Redshift Serverless independente (namespace + workgroup) e um
+  papel para carregar dados com COPY a partir do S3. As operacoes (criar tabela,
+  carregar, consultar) sao feitas com a Redshift Data API via scripts bash. Demo
+  autonoma, sem relacao com o data lake nem com a demo de Step Functions.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-class
+    Description: Prefixo para nomear os recursos.
+  RedshiftDatabaseName:
+    Type: String
+    Default: aws_class_demo
+    Description: Banco de dados do Redshift Serverless.
+  RedshiftAdminUser:
+    Type: String
+    Default: rsadmin
+    Description: Usuario administrador do namespace.
+  RedshiftBaseCapacity:
+    Type: Number
+    Default: 8
+    Description: Capacidade base do workgroup em RPUs (minimo 8 para otimizar custo).
+  DataBucket:
+    Type: String
+    Description: >
+      Bucket S3 onde o CSV de amostra e enviado para o COPY. O script de carga
+      o envia para la. Pode ser o bucket de artefatos da conta.
+
+Resources:
+
+  # Papel que o Redshift assume para o COPY a partir do S3.
+  RedshiftCopyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-rs-copy-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: redshift.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: read-data-bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${DataBucket}"
+                  - !Sub "arn:aws:s3:::${DataBucket}/*"
+
+  RedshiftNamespace:
+    Type: AWS::RedshiftServerless::Namespace
+    Properties:
+      NamespaceName: !Sub "${ProjectName}-rs-ns"
+      AdminUsername: !Ref RedshiftAdminUser
+      AdminUserPassword: "{{resolve:secretsmanager:aws-class-rs-admin:SecretString:password}}"
+      DbName: !Ref RedshiftDatabaseName
+      IamRoles:
+        - !GetAtt RedshiftCopyRole.Arn
+      DefaultIamRoleArn: !GetAtt RedshiftCopyRole.Arn
+
+  RedshiftWorkgroup:
+    Type: AWS::RedshiftServerless::Workgroup
+    Properties:
+      WorkgroupName: !Sub "${ProjectName}-rs-wg"
+      NamespaceName: !Ref RedshiftNamespace
+      BaseCapacity: !Ref RedshiftBaseCapacity
+      PubliclyAccessible: false
+
+Outputs:
+  WorkgroupName:
+    Description: Workgroup do Redshift Serverless.
+    Value: !Ref RedshiftWorkgroup
+  DatabaseName:
+    Description: Banco de dados.
+    Value: !Ref RedshiftDatabaseName
+  CopyRoleArn:
+    Description: Papel que o Redshift usa para o COPY a partir do S3.
+    Value: !GetAtt RedshiftCopyRole.Arn

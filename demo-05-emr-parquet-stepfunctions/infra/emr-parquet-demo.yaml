@@ -1,0 +1,346 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Demo 05 - EMR Serverless + Parquet + Step Functions (plataforma de cursos online).
+  Ramificacao analitica em paralelo (ao lado da de Redshift da Demo 04): quando o
+  pipeline do data lake termina de curar, uma State Machine orquestra um job de
+  EMR Serverless que reescreve curated (JSON) para Parquet, e depois um Glue Crawler
+  que cataloga a tabela Parquet. Permite comparar no Athena JSON vs Parquet.
+  Importa recursos da Demo 01 (ImportValue).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-class
+    Description: Prefixo para nomear os recursos.
+  ScriptsBucket:
+    Type: String
+    Description: Bucket S3 com o script PySpark do EMR (emr/curated_json_to_parquet.py).
+  OutputPrefix:
+    Type: String
+    Default: "analytics/student-engagement-parquet/"
+    Description: Prefixo S3 de saida para o Parquet.
+
+Resources:
+
+  # ===========================================================================
+  # 1) EMR SERVERLESS - aplicacao Spark + papel de execucao
+  # ===========================================================================
+  EmrServerlessApp:
+    Type: AWS::EMRServerless::Application
+    Properties:
+      Name: !Sub "${ProjectName}-parquet-app"
+      ReleaseLabel: emr-7.2.0
+      Type: SPARK
+      # Inicia ao enviar o job e para ao ficar ocioso (otimiza custo).
+      AutoStartConfiguration:
+        Enabled: true
+      AutoStopConfiguration:
+        Enabled: true
+        IdleTimeoutMinutes: 5
+
+  # Papel que o EMR Serverless assume para executar o job (ler/escrever S3).
+  EmrJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-emr-job-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: emr-serverless.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: datalake-and-scripts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Ler curated (JSON) e escrever analytics (Parquet) no data lake
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${B}"
+                    - B: !ImportValue aws-class-datalake-BucketName
+                  - !Sub
+                    - "arn:aws:s3:::${B}/*"
+                    - B: !ImportValue aws-class-datalake-BucketName
+              # Ler o script PySpark
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${ScriptsBucket}"
+                  - !Sub "arn:aws:s3:::${ScriptsBucket}/*"
+
+  # ===========================================================================
+  # 2) GLUE CRAWLER - cataloga a tabela Parquet (prefixo de tabela parquet_)
+  # ===========================================================================
+  ParquetCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-parquet-crawler-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: read-parquet
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${B}"
+                    - B: !ImportValue aws-class-datalake-BucketName
+                  - !Sub
+                    - "arn:aws:s3:::${B}/*"
+                    - B: !ImportValue aws-class-datalake-BucketName
+
+  # --- Permissoes de Lake Formation para o papel do crawler -------------------
+  # O bucket do data lake esta registrado no Lake Formation (Demo 02), entao
+  # o crawler precisa de permissoes de LF (nao basta IAM+S3) para ler a location e
+  # criar/atualizar a tabela no catalogo. Requer que a Demo 02 esteja
+  # implantada e que quem implanta esta Demo 05 seja Data Lake Administrator.
+
+  # Acesso ao local dos dados (o bucket registrado).
+  CrawlerDataLocationGrant:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt ParquetCrawlerRole.Arn
+      Resource:
+        DataLocation:
+          CatalogId: !Ref AWS::AccountId
+          ResourceArn: !ImportValue aws-class-datalake-BucketArn
+      Permissions:
+        - DATA_LOCATION_ACCESS
+      PermissionsWithGrantOption: []
+
+  # Permissao para criar/alterar tabelas no banco do catalogo.
+  CrawlerDatabaseGrant:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt ParquetCrawlerRole.Arn
+      Resource:
+        Database:
+          CatalogId: !Ref AWS::AccountId
+          Name: !ImportValue aws-class-datalake-GlueDatabase
+      Permissions:
+        - CREATE_TABLE
+        - ALTER
+        - DESCRIBE
+      PermissionsWithGrantOption: []
+
+  ParquetCrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn:
+      - CrawlerDataLocationGrant
+      - CrawlerDatabaseGrant
+    Properties:
+      Name: !Sub "${ProjectName}-crawler-parquet"
+      Role: !GetAtt ParquetCrawlerRole.Arn
+      DatabaseName: !ImportValue aws-class-datalake-GlueDatabase
+      TablePrefix: parquet_
+      Targets:
+        S3Targets:
+          - Path: !Sub
+              - "s3://${B}/${OutputPrefix}"
+              - B: !ImportValue aws-class-datalake-BucketName
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  # ===========================================================================
+  # 3) STEP FUNCTIONS - orquestra EMR (JSON->Parquet) e depois o crawler
+  # ===========================================================================
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-emr-sfn-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: orchestrate-emr-and-crawler
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # EMR Serverless startJobRun.sync (inclui eventos para o padrao .sync)
+              - Effect: Allow
+                Action:
+                  - emr-serverless:StartJobRun
+                  - emr-serverless:GetJobRun
+                  - emr-serverless:CancelJobRun
+                  - emr-serverless:StartApplication
+                  - emr-serverless:GetApplication
+                Resource: "*"
+              # Passar o papel de execucao do EMR ao job
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt EmrJobRole.Arn
+              # Glue crawler: iniciar e consultar o estado (polling)
+              - Effect: Allow
+                Action:
+                  - glue:StartCrawler
+                  - glue:GetCrawler
+                Resource: "*"
+              # Managed rule que o Step Functions cria para o padrao .sync do EMR
+              # Serverless (recebe o evento de fim do job). O nome exato e
+              # gerenciado pela AWS; o padrao StepFunctions* cobre a regra gerenciada.
+              - Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                  - events:DeleteRule
+                  - events:RemoveTargets
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsFor*"
+
+  ParquetStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${ProjectName}-emr-parquet-pipeline"
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionSubstitutions:
+        AppId: !GetAtt EmrServerlessApp.ApplicationId
+        EmrRoleArn: !GetAtt EmrJobRole.Arn
+        ScriptLocation: !Sub "s3://${ScriptsBucket}/src/emr/curated_json_to_parquet.py"
+        DataBucket: !ImportValue aws-class-datalake-BucketName
+        OutputPrefix: !Ref OutputPrefix
+        CrawlerName: !Ref ParquetCrawler
+      DefinitionString: |
+        {
+          "Comment": "EMR Serverless: curated JSON -> Parquet, depois crawler",
+          "StartAt": "RunEmrJob",
+          "States": {
+            "RunEmrJob": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::emr-serverless:startJobRun.sync",
+              "Parameters": {
+                "ApplicationId": "${AppId}",
+                "ExecutionRoleArn": "${EmrRoleArn}",
+                "Name": "curated-json-to-parquet",
+                "JobDriver": {
+                  "SparkSubmit": {
+                    "EntryPoint": "${ScriptLocation}",
+                    "EntryPointArguments": [
+                      "--data_bucket", "${DataBucket}",
+                      "--input_prefix", "curated/student-engagement/",
+                      "--output_prefix", "${OutputPrefix}"
+                    ],
+                    "SparkSubmitParameters": "--conf spark.executor.cores=2 --conf spark.executor.memory=4g --conf spark.driver.cores=2 --conf spark.driver.memory=4g --conf spark.executor.instances=2"
+                  }
+                }
+              },
+              "Retry": [
+                { "ErrorEquals": ["States.ALL"], "IntervalSeconds": 15, "MaxAttempts": 1, "BackoffRate": 2.0 }
+              ],
+              "Next": "StartCrawler"
+            },
+            "StartCrawler": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+              "Parameters": { "Name": "${CrawlerName}" },
+              "ResultPath": "$.crawlerStart",
+              "Next": "WaitCrawler"
+            },
+            "WaitCrawler": {
+              "Type": "Wait", "Seconds": 20, "Next": "CheckCrawler"
+            },
+            "CheckCrawler": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+              "Parameters": { "Name": "${CrawlerName}" },
+              "ResultPath": "$.crawlerStatus",
+              "Next": "CrawlerDone?"
+            },
+            "CrawlerDone?": {
+              "Type": "Choice",
+              "Choices": [
+                { "Variable": "$.crawlerStatus.Crawler.State", "StringEquals": "READY", "Next": "Success" }
+              ],
+              "Default": "WaitCrawler"
+            },
+            "Success": { "Type": "Succeed" }
+          }
+        }
+
+  # ===========================================================================
+  # 4) EVENTBRIDGE - dispara a State Machine quando o job cleaned->curated
+  #    da Demo 01 termina (MESMO evento que a Demo 04 escuta, em paralelo).
+  # ===========================================================================
+  EventBridgeInvokeSfnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-emr-eventbridge-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-state-machine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref ParquetStateMachine
+
+  CuratedJobSucceededRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-curated-job-to-parquet"
+      Description: >
+        Dispara a ramificacao Parquet (EMR + crawler) quando o Glue job
+        cleaned->curated termina com sucesso. Roda em paralelo a ramificacao
+        Redshift da Demo 04.
+      EventPattern: |
+        {
+          "source": ["aws.glue"],
+          "detail-type": ["Glue Job State Change"],
+          "detail": {
+            "jobName": ["aws-class-cleaned-to-curated"],
+            "state": ["SUCCEEDED"]
+          }
+        }
+      Targets:
+        - Id: parquet-pipeline-sfn
+          Arn: !Ref ParquetStateMachine
+          RoleArn: !GetAtt EventBridgeInvokeSfnRole.Arn
+
+Outputs:
+  EmrApplicationId:
+    Description: ID da aplicacao EMR Serverless.
+    Value: !GetAtt EmrServerlessApp.ApplicationId
+  EmrJobRoleArn:
+    Description: Papel de execucao dos jobs do EMR.
+    Value: !GetAtt EmrJobRole.Arn
+  ParquetCrawlerName:
+    Description: Crawler que cataloga a tabela Parquet.
+    Value: !Ref ParquetCrawler
+  OutputParquetPrefix:
+    Description: Prefixo S3 do Parquet.
+    Value: !Ref OutputPrefix

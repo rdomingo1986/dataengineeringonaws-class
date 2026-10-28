@@ -1,0 +1,41 @@
+# =====================================================================
+# .gitignore do repositório de demos (Data Engineering on AWS)
+# =====================================================================
+
+# Artefatos gerados pelo "cloudformation package" / SAM (contêm o ID de conta
+# e o hash do upload; são recriados a cada deploy).
+packaged.yaml
+**/packaged.yaml
+.aws-sam/
+
+# Empacotamento de Lambdas
+*.zip
+build/
+dist/
+
+# Python
+*.pyc
+__pycache__/
+.venv/
+venv/
+
+# Diagrama gerado (opcional: descomente se não quiser versionar o PNG)
+# diagrams/*.png
+
+# Saídas temporárias e de sistema
+*.log
+.DS_Store
+Thumbs.db
+
+# Credenciais (nunca versionar)
+.env
+*.pem
+aws-credentials*
+
+# Datasets grandes gerados pelo script (recriáveis; não versionar).
+# Mantém-se apenas os lotes pequenos de exemplo (student-events-batch-*.json).
+demo-01-datalake-foundations/data/student-events-large.json
+demo-01-datalake-foundations/data/student-events-200k.json
+demo-01-datalake-foundations/data/student-events-*k.json
+# Qualquer saída gerada com um nome personalizado além dos lotes de exemplo:
+demo-01-datalake-foundations/data/generated-*.json
